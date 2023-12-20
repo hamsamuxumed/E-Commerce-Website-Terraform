@@ -1,0 +1,27 @@
+{
+  "Version": "2012-10-17",
+  "Id": "EC2-Network-Interfaces",
+  "Statement": [
+    {
+      "Sid": "",
+      "Effect": "Allow",
+      "Action": "ec2:AttachNetworkInterface",
+      "Resource": [
+        "arn:aws:ec2:*:${account_id}:network-interface/*",
+        "arn:aws:ec2:*:${account_id}:instance/*"
+      ]
+    },
+    {
+      "Sid": "",
+      "Effect": "Allow",
+      "Action": "ec2:DescribeNetworkInterfaces",
+      "Resource": "*"
+    },
+    {
+      "Sid": "",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": "*"
+    }
+  ]
+}
