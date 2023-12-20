@@ -1,0 +1,138 @@
+# This workflow installs the latest version of Terraform CLI and initilizes Terraform to use an AWS access key,
+# This workflow runs whenever a PR is opened. It installs the latest version of Terraform CLI and initilizes
+# temporary AWS credentials using an OIDC provider. Other required API keys which are retrieved from GitHub
+# Actions secrets. The workflow then runs a Terraform plan, which is posted to the PR for approval. The
+# Terraform plan artifact is saved so that it can be applied by a different workflow later when the PR is merged.
+#
+# Documentation for `hashicorp/setup-terraform` is located here: https://github.com/hashicorp/setup-terraform
+# and other required API keys which are stored in the GitHub Actions secrets.
+#
+
+name: 'Terraform plan'
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write # This is required for requesting the JWT
+
+jobs:
+  terraform:
+    name: 'Terraform plan'
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+    # Checkout the repository to the GitHub Actions runner
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    # Authentication for AWS Role (CHANGE THESE DETAILS BELOW, WHAT TO CHANGE = role-to-assume[create a new role user manually on the console and get the role arn  ])
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        role-to-assume: arn:aws:iam::802835481279:role/github-actions-terraform-state 
+        role-session-name: github-actions-workflow
+        aws-region: us-east-1
+
+    # Install the latest version of Terraform CLI
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+
+    # Initialize a new or existing Terraform working directory by creating initial files, loading any remote state, downloading modules, etc.
+    # Retrieve AWS access keys from the secrets stored in GitHub actions
+    - name: Terraform Init
+      id: init
+      run: terraform init -input=false
+
+    # Check that all Terraform configuration files adhere to a canonical format
+    - name: Terraform Format
+      id: fmt
+      run: terraform fmt -check
+
+    # Check syntax of Terraform files
+    - name: Terraform Validate
+      id: validate
+      run: terraform validate -no-color
+
+    # Generate an execution plan for Terraform
+    - name: Terraform Plan
+      id: plan
+      run: terraform plan -no-color -input=false -out=tf.plan
+      continue-on-error: true # Continue so we can post the plan to the PR, even if this step fails
+
+    # Save the terraform plan as artifact for later use
+    - name: Save Artifact
+      id: save-artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ github.event.pull_request.number }}-tf-plan
+        path: tf.plan
+
+    # Add the Terraform plan output to the PR as a comment
+    - name: Update Pull Request
+      uses: actions/github-script@v6
+      if: github.event_name == 'pull_request'
+      env:
+        PLAN: "${{ steps.plan.outputs.stdout }}"
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          // 1. Retrieve existing bot comments for the PR
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          })
+          const botComment = comments.find(comment => {
+            return comment.user.type === 'Bot' && comment.body.includes('Terraform Format and Style')
+          })
+
+          // 2. Prepare format of the comment
+          const output = `## Terraform Plan Results
+          #### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+          #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+          #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+          #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+
+          <details open><summary>Show Plan</summary>
+
+          \`\`\`terraform\n
+          ${process.env.PLAN}
+          \`\`\`
+
+          </details>
+
+          *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+          // 3. If we have a comment, update it, otherwise create a new one
+          if (botComment) {
+            github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: botComment.id,
+              body: output
+          })
+          } else {
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+          }
+
+    # Make sure that the workflow eventually fails if the plan fails (so we can block the PR from being merged if the plan failed)
+    - name: Terraform Plan Status
+      if: steps.plan.outcome == 'failure'
+      run: |
+        echo "::error::Terraform plan failed. Please see the output of the 'Terraform Plan' step above for more info."
+        exit 1
