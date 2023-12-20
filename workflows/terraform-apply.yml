@@ -1,0 +1,125 @@
+# This workflow runs whenever a PR is merged. It installs the latest version of Terraform CLI and initilizes
+# temporary AWS credentials using an OIDC provider. Other required API keys which are retrieved from GitHub
+# Actions secrets. The workflow then retrieves a previously created Terraform plan artifact (which was created
+# during PR creation) and applies it. The results of the apply are posted back to the PR.
+#
+# Documentation for `hashicorp/setup-terraform` is located here: https://github.com/hashicorp/setup-terraform
+#
+
+name: 'Terraform apply'
+
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - main
+
+permissions: 
+  contents: read
+  pull-requests: read
+  id-token: write # This is required for requesting the JWT
+  actions: read
+
+jobs:
+  terraform:
+     # Very Important! Don't run the job if the PR was closed without merging.
+    if: github.event.pull_request.merged == true
+    name: 'Terraform apply'
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+    # Checkout the repository to the GitHub Actions runner
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    # Authentication for AWS Role
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        role-to-assume: arn:aws:iam::802835481279:role/github-actions-terraform-state # CHANGE THIS TO ROLE ARN YOU GET FROM THE ROLE YOU CREATE 
+        role-session-name: github-actions-workflow
+        aws-region: us-east-1
+
+    # Install the latest version of Terraform CLI
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+
+    # Initialize a new or existing Terraform working directory by creating initial files, loading any remote state, downloading modules, etc.
+    # Retrieve AWS access keys from the secrets stored in GitHub actions
+    - name: Terraform Init
+      id: init
+      run: terraform init -input=false
+
+    # Download Plan artifact
+    - name: Download Plan
+      id: download-plan
+      uses: dawidd6/action-download-artifact@v2
+      with:
+        workflow: terraform-plan.yml
+        pr: ${{ github.event.pull_request.number }}
+        name: ${{ github.event.pull_request.number }}-tf-plan
+
+    # On PR merge, build or change infrastructure according to Terraform configuration files
+    - name: Terraform Apply
+      id: apply
+      run: terraform apply -auto-approve -input=false -no-color tf.plan
+      continue-on-error: true # Continue so we can post the output to the PR, even if this step fails
+
+    # Add the Terraform apply output to the PR as a comment
+    - name: Update Pull Request
+      uses: actions/github-script@v6
+      env:
+        APPLY: "${{ steps.apply.outputs.stdout }}"
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          // 1. Retrieve existing bot comments for the PR
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          })
+          const botComment = comments.find(comment => {
+            return comment.user.type === 'Bot' && comment.body.includes('Terraform Apply Results')
+          })
+
+          // 2. Prepare format of the comment
+          const output = `## Terraform Apply Results
+          #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+          #### Terraform Apply 🔨\`${{ steps.apply.outcome }}\`
+
+          <details open><summary>Show Apply</summary>
+
+          \`\`\`terraform\n
+          ${process.env.APPLY}
+          \`\`\`
+
+          </details>
+
+          *Merged by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+          // 3. If we have a comment, update it, otherwise create a new one
+          if (botComment) {
+            github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: botComment.id,
+              body: output
+          })
+          } else {
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+          }
+
+    # Make sure that the workflow eventually fails if the apply fails
+    - name: Terraform Apply Status
+      if: steps.apply.outcome == 'failure'
+      run: |
+        echo "::error::Terraform apply failed. Please see the output of the 'Terraform Apply' step above for more info."
+        exit 1
